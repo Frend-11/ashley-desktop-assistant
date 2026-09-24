@@ -394,6 +394,10 @@ function handleWakeEnrollmentCommand(command: 'start' | 'capture' | 'cancel') {
   }
   if (command === 'start') {
     wakeEnrollment = { awaitingSample: false, samples: [] };
+    if (activeSession) {
+      reportWakeEnrollment('error', '请先让 Ashley 退下并等待本地唤醒恢复，再继续录入。');
+      return;
+    }
     if (wakeRunning) {
       reportWakeEnrollment('ready', '准备好了。点击按钮后，自然说一遍 “Ashley”。');
       return;
@@ -406,11 +410,20 @@ function handleWakeEnrollmentCommand(command: 'start' | 'capture' | 'cancel') {
         reportWakeEnrollment('ready', '准备好了。点击按钮后，自然说一遍 “Ashley”。');
         return;
       }
-      if (attempt >= 40) {
-        reportWakeEnrollment('error', '唤醒麦克风仍未就绪，请关闭窗口后检查 Jarvis。');
+      if (activeSession) {
+        reportWakeEnrollment('error', '请先让 Ashley 退下并等待本地唤醒恢复，再继续录入。');
         return;
       }
-      window.setTimeout(() => waitUntilReady(attempt + 1), 250);
+      // 实时会话、唤醒切换、模型加载和退下后的保持期都会合法地关闭
+      // 唤醒麦克风。只有没有任何启动流程在进行中的空闲时间才计入超时。
+      const startPending =
+        wakeStartInProgress || wakeHealthRecoveryRunning || performance.now() < wakeResumeNotBefore;
+      if (attempt >= 40 && !startPending) {
+        const detail = lastWakeStartError ? `（${lastWakeStartError}）` : '';
+        reportWakeEnrollment('error', `唤醒麦克风仍未就绪${detail}，请关闭窗口后检查 Jarvis。`);
+        return;
+      }
+      window.setTimeout(() => waitUntilReady(startPending ? attempt : attempt + 1), 250);
     };
     window.setTimeout(() => waitUntilReady(1), 250);
     return;
@@ -431,6 +444,7 @@ let wakeHealthRecoveryRunning = false;
 // open a second stream; two concurrent wakeEngine.start() calls race for the
 // same AudioContext and have produced DOMException plus minute-long delays.
 let wakeStartInProgress = false;
+let lastWakeStartError: string | null = null;
 // Long-idle failures showed a live microphone/VAD but no keyword candidates
 // after roughly an hour. Refreshing well before that clears the VAD recurrent
 // state, embedding history and AudioWorklet without changing sensitivity.
@@ -605,6 +619,7 @@ async function startWakeWord() {
     await wakeEngine.start({ gain: voiceConfig.wakeGain });
     await enableWakeMicrophoneSpeechProcessing();
     wakeRunning = true;
+    lastWakeStartError = null;
     wakeEngineStartedAt = performance.now();
     // Re-arm from the moment the engine is actually considered live, so the full
     // warm-up applies no matter how long startup took.
@@ -618,6 +633,7 @@ async function startWakeWord() {
       `Listening locally for: ${voiceConfig.wakeModels.map(({ keyword }) => keyword).join(', ')}.`
     );
   } catch (error) {
+    lastWakeStartError = error instanceof Error ? error.message : String(error);
     console.error('[Jarvis] Unable to start local wake-word detection.', error);
   } finally {
     wakeStartInProgress = false;

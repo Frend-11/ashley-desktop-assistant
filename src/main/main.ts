@@ -2,6 +2,7 @@ import {
   app,
   BrowserWindow,
   clipboard,
+  dialog,
   globalShortcut,
   ipcMain,
   type IpcMainEvent,
@@ -21,8 +22,33 @@ import { promises as fs } from 'node:fs';
 import path from 'node:path';
 import { DoubaoVoiceTransport } from './doubao-voice-transport';
 import { loadEnvironment } from './environment';
+import {
+  buildAmapDirectionsUrl,
+  buildAmapSearchUrl,
+  closeLinuxApplication,
+  hasLinuxVisibleApplicationWindows,
+  openLinuxApplication,
+  playLinuxSystemSound,
+  resolveCoarseLocationLinux,
+  switchLinuxDesktop
+} from './linux-actions';
+import { controlMprisPlayer } from './mpris';
+import { isOpenClawAvailable, resolveOpenClawBin, runOpenClawTask } from './openclaw-bridge';
 import os from 'node:os';
 import { describeWeather, type WeatherCoordinates } from './weather';
+import {
+  closeWindowsApplication,
+  dumpWindowsMusicPlayerUi,
+  hasWindowsVisibleApplicationWindows,
+  isWindowsMusicPlayerInstalled,
+  openWindowsApplication,
+  playWindowsSystemSound,
+  resolveCoarseLocationWindows,
+  searchAndPlayWindowsMusic,
+  sendWindowsMediaKey,
+  switchWindowsDesktop,
+  type WindowsMusicPlayer
+} from './windows-actions';
 
 // Coarse device location for weather. macOS attributes permission to the
 // helper .app bundle, which shows its own purpose string.
@@ -36,6 +62,52 @@ let coarseLocationCache: { at: number; value: WeatherCoordinates | null } | null
 let coarseLocationInFlight: Promise<WeatherCoordinates | null> | null = null;
 const coarseLocationTtlMs = 10 * 60_000;
 
+async function resolveCoarseLocationPlatform(): Promise<WeatherCoordinates | null> {
+  if (process.platform === 'linux') {
+    const value = await resolveCoarseLocationLinux();
+    log(value
+      ? 'Coarse location resolved via IP lookup (city level) for weather.'
+      : 'Coarse location unavailable; weather falls back to the default city.');
+    return value;
+  }
+  if (process.platform === 'win32') {
+    const value = await resolveCoarseLocationWindows();
+    log(value
+      ? 'Coarse location resolved for weather (Windows location API, falling back to IP lookup).'
+      : 'Coarse location unavailable; weather falls back to the default city.');
+    return value;
+  }
+  if (process.platform !== 'darwin') return null;
+
+  const locationApp = app.isPackaged
+    ? path.join(process.resourcesPath, 'app.asar.unpacked/dist/native/JarvisLocation.app')
+    : path.join(__dirname, '../native/JarvisLocation.app');
+  const temporaryRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'jarvis-location-'));
+  const outputPath = path.join(temporaryRoot, 'coarse-location.json');
+  try {
+    await fs.writeFile(outputPath, '', { mode: 0o600 });
+    await new Promise<void>((resolve, reject) => {
+      execFile('/usr/bin/open', ['-W', '-n', '-g', '-o', outputPath, locationApp],
+        { timeout: 35_000, maxBuffer: 8_192 },
+        (error) => (error ? reject(error) : resolve()));
+    });
+    const raw = (await fs.readFile(outputPath, 'utf8')).trim();
+    const result = JSON.parse(raw) as { success?: boolean; latitude?: number; longitude?: number; status?: string };
+    if (result.success && Number.isFinite(result.latitude) && Number.isFinite(result.longitude)) {
+      const value = { latitude: Number(result.latitude), longitude: Number(result.longitude) };
+      log(`Coarse location resolved (~1km) for weather.`);
+      return value;
+    }
+    log(`Coarse location unavailable (${result.status ?? 'unknown'}); weather falls back to the default city.`);
+    return null;
+  } catch (error) {
+    log(`Coarse location failed: ${error instanceof Error ? error.message : String(error)}`);
+    return null;
+  } finally {
+    await fs.rm(temporaryRoot, { recursive: true, force: true }).catch(() => undefined);
+  }
+}
+
 function getCoarseLocation(): Promise<WeatherCoordinates | null> {
   if (coarseLocationCache && Date.now() - coarseLocationCache.at < coarseLocationTtlMs) {
     return Promise.resolve(coarseLocationCache.value);
@@ -43,35 +115,15 @@ function getCoarseLocation(): Promise<WeatherCoordinates | null> {
   if (coarseLocationInFlight) return coarseLocationInFlight;
 
   coarseLocationInFlight = (async (): Promise<WeatherCoordinates | null> => {
-    const locationApp = app.isPackaged
-      ? path.join(process.resourcesPath, 'app.asar.unpacked/dist/native/JarvisLocation.app')
-      : path.join(__dirname, '../native/JarvisLocation.app');
-    const temporaryRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'jarvis-location-'));
-    const outputPath = path.join(temporaryRoot, 'coarse-location.json');
     try {
-      await fs.writeFile(outputPath, '', { mode: 0o600 });
-      await new Promise<void>((resolve, reject) => {
-        execFile('/usr/bin/open', ['-W', '-n', '-g', '-o', outputPath, locationApp],
-          { timeout: 35_000, maxBuffer: 8_192 },
-          (error) => (error ? reject(error) : resolve()));
-      });
-      const raw = (await fs.readFile(outputPath, 'utf8')).trim();
-      const result = JSON.parse(raw) as { success?: boolean; latitude?: number; longitude?: number; status?: string };
-      if (result.success && Number.isFinite(result.latitude) && Number.isFinite(result.longitude)) {
-        const value = { latitude: Number(result.latitude), longitude: Number(result.longitude) };
-        log(`Coarse location resolved (~1km) for weather.`);
-        coarseLocationCache = { at: Date.now(), value };
-        return value;
-      }
-      log(`Coarse location unavailable (${result.status ?? 'unknown'}); weather falls back to the default city.`);
-      coarseLocationCache = { at: Date.now(), value: null };
-      return null;
+      const value = await resolveCoarseLocationPlatform();
+      coarseLocationCache = { at: Date.now(), value };
+      return value;
     } catch (error) {
       log(`Coarse location failed: ${error instanceof Error ? error.message : String(error)}`);
       coarseLocationCache = { at: Date.now(), value: null };
       return null;
     } finally {
-      await fs.rm(temporaryRoot, { recursive: true, force: true }).catch(() => undefined);
       coarseLocationInFlight = null;
     }
   })();
@@ -325,6 +377,8 @@ function resolveRuntimeResource(...segments: string[]) {
 }
 
 function hasVisibleApplicationWindows() {
+  if (process.platform === 'linux') return hasLinuxVisibleApplicationWindows();
+  if (process.platform === 'win32') return hasWindowsVisibleApplicationWindows();
   const helperPath = resolveRuntimeResource('native', 'window-status');
   return new Promise<boolean>((resolve, reject) => {
     execFile(
@@ -459,6 +513,16 @@ function presentAssemblyWindow() {
 
 function playAssemblySound() {
   const soundPath = resolveRuntimeResource('assets', 'sounds', 'assembly.wav');
+  if (process.platform === 'linux') {
+    playLinuxSystemSound(soundPath).catch((error) => {
+      console.error(`[${new Date().toISOString()}] [Ashley] Unable to play assembly sound.`, error);
+    });
+    return;
+  }
+  if (process.platform === 'win32') {
+    playWindowsSystemSound(soundPath);
+    return;
+  }
   execFile('afplay', [soundPath], (error) => {
     if (error) console.error(`[${new Date().toISOString()}] [Ashley] Unable to play assembly sound.`, error);
   });
@@ -544,6 +608,8 @@ const localizedAppBundleIds: Record<string, string> = {
 };
 
 function openApplication(applicationName: string) {
+  if (process.platform === 'linux') return openLinuxApplication(applicationName);
+  if (process.platform === 'win32') return openWindowsApplication(applicationName);
   return new Promise<void>((resolve, reject) => {
     execFile('/usr/bin/open', ['-a', applicationName], (error) => {
       if (error) reject(new Error(`无法打开应用“${applicationName}”。`));
@@ -552,7 +618,7 @@ function openApplication(applicationName: string) {
   });
 }
 
-type MusicApplication = 'kugou' | 'netease';
+type MusicApplication = 'kugou' | 'netease' | 'soda';
 type MusicControlAction = 'play_pause' | 'next' | 'previous';
 
 let lastMusicApplication: MusicApplication | null = null;
@@ -572,6 +638,13 @@ const musicApplicationDetails: Record<MusicApplication, {
     bundleId: 'com.netease.163music',
     displayName: '网易云音乐',
     installedPaths: ['/Applications/NeteaseMusic.app', path.join(os.homedir(), 'Applications/NeteaseMusic.app')]
+  },
+  // 汽水音乐没有 macOS 客户端;空 installedPaths 让 macOS 分支自然报错,
+  // Windows 分支走自己的安装检测。
+  soda: {
+    bundleId: '',
+    displayName: '汽水音乐',
+    installedPaths: []
   }
 };
 
@@ -696,6 +769,9 @@ async function playMusic(
   song: string,
   artist: string
 ) {
+  if (process.platform === 'linux') {
+    throw new Error('Linux 版暂不支持搜索播放歌曲。请先在播放器里选好音乐，再说播放暂停、上一首或下一首。');
+  }
   if (process.platform !== 'darwin') throw new Error('音乐播放控制目前仅支持 macOS。');
   if (!systemPreferences.isTrustedAccessibilityClient(true)) {
     await shell.openExternal('x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility');
@@ -810,6 +886,7 @@ async function playMusic(
 }
 
 async function controlMusic(applicationName: MusicApplication, action: MusicControlAction) {
+  if (process.platform === 'linux') return controlMprisPlayer(action);
   if (process.platform !== 'darwin') throw new Error('音乐播放控制目前仅支持 macOS。');
   if (!systemPreferences.isTrustedAccessibilityClient(true)) {
     await shell.openExternal('x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility');
@@ -897,6 +974,35 @@ async function controlMusic(applicationName: MusicApplication, action: MusicCont
       : '已切换播放或暂停。';
 }
 
+// Windows 语音搜歌:驱动本机已登录的播放器客户端,经 SMTC 确认开始播放。
+// 界面坐标未校准时 played 为 false,调用方据此不谎报成功。
+const windowsMusicPlayers: WindowsMusicPlayer[] = ['netease', 'kugou', 'soda'];
+
+async function resolveWindowsMusicPlayer(requested: unknown): Promise<WindowsMusicPlayer> {
+  if (requested === 'netease' || requested === 'kugou' || requested === 'soda') {
+    if (!(await isWindowsMusicPlayerInstalled(requested))) {
+      throw new Error(`没有检测到${musicApplicationDetails[requested].displayName}，请先安装后再试。`);
+    }
+    return requested;
+  }
+  for (const player of windowsMusicPlayers) {
+    if (await isWindowsMusicPlayerInstalled(player)) return player;
+  }
+  throw new Error('没有检测到网易云音乐、酷狗音乐或汽水音乐。');
+}
+
+async function playMusicWindows(player: WindowsMusicPlayer, song: string, artist: string) {
+  const details = musicApplicationDetails[player];
+  const query = artist ? `${song} ${artist}` : song;
+  const result = await searchAndPlayWindowsMusic(player, query);
+  lastMusicApplication = player;
+  log(`Windows music search steps (${player}): ${result.steps.join(' | ')}`);
+  if (!result.played) {
+    throw new Error(`没能在${details.displayName}中确认开始播放《${song}》，请手动确认一下。`);
+  }
+  return `已用${details.displayName}播放《${song}》${artist ? `，${artist}` : ''}。`;
+}
+
 async function switchMacDesktop(destination: 'first' | 'second' | 'next' | 'previous') {
   if (process.platform !== 'darwin') throw new Error('切换桌面仅支持 macOS。');
 
@@ -956,8 +1062,11 @@ async function queryGuanlan(question: string) {
     throw new Error(`没有找到观澜数据库：${guanlanDatabasePath}`);
   }
 
-  const virtualEnvironmentPython = path.join(guanlanProjectRoot, '.venv', 'bin', 'python');
-  const python = existsSync(virtualEnvironmentPython) ? virtualEnvironmentPython : '/usr/bin/python3';
+  const virtualEnvironmentPython = process.platform === 'win32'
+    ? path.join(guanlanProjectRoot, '.venv', 'Scripts', 'python.exe')
+    : path.join(guanlanProjectRoot, '.venv', 'bin', 'python');
+  const fallbackPython = process.platform === 'win32' ? 'python' : '/usr/bin/python3';
+  const python = existsSync(virtualEnvironmentPython) ? virtualEnvironmentPython : fallbackPython;
   const sourceRoot = path.join(guanlanProjectRoot, 'src');
   const result = await new Promise<string>((resolve, reject) => {
     execFile(
@@ -1009,7 +1118,7 @@ async function executeComputerAction(name: string, rawArgs: unknown) {
         timeStyle: 'medium',
         timeZone
       }).format(now);
-      return `当前 Mac 系统时间：${formatted}；时区：${timeZone}。`;
+      return `当前系统时间：${formatted}；时区：${timeZone}。`;
     }
     case 'show_jarvis': {
       showJarvisByVoiceRequest();
@@ -1057,15 +1166,23 @@ async function executeComputerAction(name: string, rawArgs: unknown) {
       // Without an explicit origin, use the device's coarse position so that
       // "怎么去某某" plans from where the user actually is. search_maps only
       // ever dropped a pin on the destination with no route at all.
-      const from = origin || (await getCoarseLocation().then(
-        (c) => (c ? `${c.latitude},${c.longitude}` : '')
-      ));
-      const mode = args.mode === 'walking' ? 'w' : args.mode === 'transit' ? 'r' : 'd';
+      const coordinates = origin ? null : await getCoarseLocation();
+      const mode: 'driving' | 'walking' | 'transit' =
+        args.mode === 'walking' ? 'walking' : args.mode === 'transit' ? 'transit' : 'driving';
+      hideJarvisForVisibleAction();
+      if (process.platform !== 'darwin') {
+        const url = buildAmapDirectionsUrl(destination, coordinates, mode);
+        await shell.openExternal(url);
+        return coordinates
+          ? `已规划到${destination}的路线。`
+          : `已打开到${destination}的路线，但没能确定你的位置，请在地图里填起点。`;
+      }
+      const from = origin || (coordinates ? `${coordinates.latitude},${coordinates.longitude}` : '');
+      const dirflg = mode === 'walking' ? 'w' : mode === 'transit' ? 'r' : 'd';
       const url = new URL('https://maps.apple.com/');
       if (from) url.searchParams.set('saddr', from);
       url.searchParams.set('daddr', destination);
-      url.searchParams.set('dirflg', mode);
-      hideJarvisForVisibleAction();
+      url.searchParams.set('dirflg', dirflg);
       await shell.openExternal(url.href);
       return from
         ? `已规划到${destination}的路线。`
@@ -1074,13 +1191,17 @@ async function executeComputerAction(name: string, rawArgs: unknown) {
     case 'search_web': {
       const query = requireActionText(args, 'query', 500);
       hideJarvisForVisibleAction();
-      await shell.openExternal(`https://www.google.com/search?q=${encodeURIComponent(query)}`);
+      await shell.openExternal(`https://cn.bing.com/search?q=${encodeURIComponent(query)}`);
       return `已搜索：${query}`;
     }
     case 'search_maps': {
       const query = requireActionText(args, 'query', 500);
       hideJarvisForVisibleAction();
-      await shell.openExternal(`https://maps.apple.com/?q=${encodeURIComponent(query)}`);
+      if (process.platform !== 'darwin') {
+        await shell.openExternal(buildAmapSearchUrl(query));
+      } else {
+        await shell.openExternal(`https://maps.apple.com/?q=${encodeURIComponent(query)}`);
+      }
       return `已在地图中搜索：${query}`;
     }
     case 'open_application': {
@@ -1092,6 +1213,31 @@ async function executeComputerAction(name: string, rawArgs: unknown) {
     case 'play_music': {
       const song = requireActionText(args, 'song', 200);
       const artist = typeof args.artist === 'string' ? args.artist.trim().slice(0, 100) : '';
+      if (process.platform === 'linux') {
+        throw new Error('Linux 版暂不支持搜索播放歌曲。请先在播放器里选好音乐，再说播放暂停、上一首或下一首。');
+      }
+      if (process.platform === 'win32') {
+        hideJarvisForVisibleAction();
+        const player = await resolveWindowsMusicPlayer(args.application);
+        const requestKey = `${player}\u0000${song}\u0000${artist}`;
+        const existingRequest = musicRequestsInFlight.get(requestKey);
+        if (existingRequest) return existingRequest;
+        const request = playMusicWindows(player, song, artist);
+        musicRequestsInFlight.set(requestKey, request);
+        try {
+          return await request;
+        } finally {
+          // Seeduplex sometimes emits its real tool call only a few milliseconds
+          // after the deterministic spoken-command fallback fires. Keep the
+          // settled promise briefly so both calls share one app action (and one
+          // permission prompt) instead of searching/playing the same song twice.
+          setTimeout(() => {
+            if (musicRequestsInFlight.get(requestKey) === request) {
+              musicRequestsInFlight.delete(requestKey);
+            }
+          }, 2_000);
+        }
+      }
       const applicationName = resolveMusicApplication(args.application);
       const requestKey = `${applicationName}\u0000${song}\u0000${artist}`;
       const existingRequest = musicRequestsInFlight.get(requestKey);
@@ -1118,12 +1264,35 @@ async function executeComputerAction(name: string, rawArgs: unknown) {
       if (action !== 'play_pause' && action !== 'next' && action !== 'previous') {
         throw new Error('音乐控制指令无效。');
       }
+      if (process.platform === 'linux') {
+        hideJarvisForVisibleAction();
+        return controlMprisPlayer(action);
+      }
+      if (process.platform === 'win32') {
+        // Media keys act on whatever player currently owns the system media
+        // session, so no per-app resolution exists on Windows.
+        hideJarvisForVisibleAction();
+        await sendWindowsMediaKey(action);
+        return action === 'next'
+          ? '已切换到下一首。'
+          : action === 'previous'
+            ? '已切换到上一首。'
+            : '已切换播放或暂停。';
+      }
       const applicationName = resolveMusicApplication(args.application);
       hideJarvisForVisibleAction();
       return controlMusic(applicationName, action);
     }
     case 'close_application': {
       const applicationName = requireActionText(args, 'application', 100);
+      if (process.platform === 'linux') {
+        await closeLinuxApplication(applicationName);
+        return `已关闭：${applicationName}`;
+      }
+      if (process.platform === 'win32') {
+        await closeWindowsApplication(applicationName);
+        return `已关闭：${applicationName}`;
+      }
       // `open -a` accepts the localized name a Chinese speaker actually says,
       // but AppleScript's `tell application "地图"` does not — it resolves by
       // the app's real name or bundle id, so every localized Apple app failed
@@ -1151,6 +1320,15 @@ async function executeComputerAction(name: string, rawArgs: unknown) {
           ? args.destination
           : 'second';
       hideJarvisForVisibleAction();
+      if (process.platform === 'linux') return switchLinuxDesktop(destination);
+      if (process.platform === 'win32') {
+        await switchWindowsDesktop(destination);
+        return destination === 'second'
+          ? '已切换到第二个桌面。'
+          : destination === 'previous'
+            ? '已切换到上一个桌面。'
+            : '已切换到下一个桌面。';
+      }
       return switchMacDesktop(destination);
     }
     case 'write_text_file': {
@@ -1173,6 +1351,28 @@ async function executeComputerAction(name: string, rawArgs: unknown) {
       }
       return `已在${folder === 'desktop' ? '桌面' : '文稿'}中新建文件“${fileName}”。`;
     }
+    case 'run_agent_task': {
+      const task = requireActionText(args, 'task', 2_000);
+      if (!isOpenClawAvailable()) throw new Error('没有检测到 OpenClaw，无法委派任务。');
+      log(`Delegating to OpenClaw agent: ${JSON.stringify(task.slice(0, 120))}`);
+      const result = await runOpenClawTask(task, {
+        userDataDir: app.getPath('userData'),
+        onHeartbeat: (elapsedSeconds) => {
+          sendState('thinking');
+          log(`OpenClaw task in progress (${Math.floor(elapsedSeconds)}s).`);
+        },
+        onEvent: (event) => {
+          if (event.type === 'text') {
+            log(`OpenClaw 回复片段: ${event.text.slice(0, 200)}`);
+          } else if (event.type === 'skill') {
+            log(`OpenClaw 调用 skill: ${event.name}`);
+          } else {
+            log(`OpenClaw 工具 ${event.name}: ${event.detail}`);
+          }
+        }
+      });
+      return result.summary ? `${result.reply}\n\n（执行过程：${result.summary}）` : result.reply;
+    }
     default:
       throw new Error(`不支持的电脑操作：${name}`);
   }
@@ -1193,7 +1393,7 @@ async function executeComputerAction(name: string, rawArgs: unknown) {
 //   error the user cannot recover from by talking, since the way out is the
 //   thing that broke.
 const doubaoInstructions = [
-  '你是 Ashley，运行在用户 Mac 上的语音管家。声音成熟、低沉、克制。',
+  '你是 Ashley，运行在用户电脑上的语音管家。声音成熟、低沉、克制。',
   '',
   '最重要的规则：调用工具时，先调用，再说话。工具调用本身就是回应。',
   '',
@@ -1217,7 +1417,7 @@ const doubaoInstructions = [
   '不要说「我没有权限」「我获取不到」「我无法访问」这类话，除非你真的调用了工具并且它返回了错误。',
   '不确定能不能做的事，先调用工具试，让工具的返回结果来回答，不要自己先下结论。',
   '用户说打开某个软件：调用 open_application。',
-  '用户说用酷狗或网易云播放某首歌：调用 play_music，先执行再简短确认，不要只口头答应。',
+  '用户说用酷狗、网易云或汽水播放某首歌：调用 play_music，先执行再简短确认，不要只口头答应。',
   '用户说播放暂停、上一首或下一首：调用 control_music；没点名软件时沿用上次播放的软件。',
   '用户说关闭某个软件，例如「关掉抖音」「把微信关了」：调用 close_application。',
   '只有用户明确要关闭 Jarvis 自己（「完全退出」「关闭 Jarvis」）才用 quit_jarvis，关闭其他应用一律用 close_application。',
@@ -1257,7 +1457,9 @@ const doubaoInstructions = [
   '',
   '称呼用「你」。需要时可以用「先生」，但不要每句都带。',
   '做完一件事，用最短的话陈述结果：例如「已打开」「已经在放了」「二十三度，多云」。',
-  '做不到的事直接说做不到，一句话，不解释也不道歉。'
+  '做不到的事直接说做不到，一句话，不解释也不道歉。',
+  '',
+  '用户要求写代码、写脚本、完成某项具体任务（处理文件、运行程序、整理资料等）：调用 run_agent_task，task 写清目标和约束。任务可能几分钟才返回，等待期间保持安静；结果返回后用自己的话简洁播报结果，不要复述原始输出。返回内容末尾的「（执行过程：…）」摘要说明执行了什么、用了哪些工具和 skill，播报时用自己的话简要转述。'
 ].join('\n');
 
 function getRealtimeSessionConfig() {
@@ -1312,7 +1514,7 @@ function getRealtimeSessionConfig() {
       {
         type: 'function',
         name: 'get_current_time',
-        description: '读取这台 Mac 当前准确的本地日期、星期、时间和时区。用户问现在几点、当前时间、今天日期或星期几时必须立即调用；这是本地只读操作，不需要额外系统权限。',
+        description: '读取这台电脑当前准确的本地日期、星期、时间和时区。用户问现在几点、当前时间、今天日期或星期几时必须立即调用；这是本地只读操作，不需要额外系统权限。',
         parameters: { type: 'object', properties: {}, additionalProperties: false }
       },
       {
@@ -1424,7 +1626,11 @@ function getRealtimeSessionConfig() {
       {
         type: 'function',
         name: 'switch_desktop',
-        description: '切换 macOS 桌面（Spaces）。用户要求切换到第一个桌面、第二个桌面、上一个桌面或下一个桌面，或只说“切换桌面”时直接调用。它会先检查 Ashley 的辅助功能与自动化授权。',
+        description: process.platform === 'darwin'
+          ? '切换 macOS 桌面（Spaces）。用户要求切换到第一个桌面、第二个桌面、上一个桌面或下一个桌面，或只说“切换桌面”时直接调用。它会先检查 Ashley 的辅助功能与自动化授权。'
+          : process.platform === 'win32'
+            ? '切换 Windows 虚拟桌面（Win+Ctrl+方向键）。用户要求切换到第一个桌面、第二个桌面、上一个桌面或下一个桌面，或只说“切换桌面”时直接调用。'
+            : '切换系统工作区。用户要求切换到第一个工作区、第二个工作区、上一个工作区或下一个工作区，或只说“切换桌面”时直接调用。',
         parameters: {
           type: 'object',
           properties: {
@@ -1463,7 +1669,7 @@ function getRealtimeSessionConfig() {
       {
         type: 'function',
         name: 'search_maps',
-        description: '使用 Apple 地图搜索地点、地址、商家或路线目的地。',
+        description: `使用 ${process.platform === 'darwin' ? 'Apple 地图' : '高德地图'}搜索地点、地址、商家或路线目的地。`,
         parameters: {
           type: 'object',
           properties: { query: { type: 'string', description: '地点或地址。' } },
@@ -1474,7 +1680,7 @@ function getRealtimeSessionConfig() {
       {
         type: 'function',
         name: 'open_application',
-        description: '打开用户明确点名的 macOS 应用，或把已经运行的应用切到最前面。用户说打开、启动、显示观澜或把观澜切到最前面时，application 填“观澜”。',
+        description: '打开用户明确点名的应用，或把已经运行的应用切到最前面。用户说打开、启动、显示观澜或把观澜切到最前面时，application 填“观澜”。',
         parameters: {
           type: 'object',
           properties: { application: { type: 'string', description: '应用名称，例如 Safari、备忘录或微信。' } },
@@ -1486,7 +1692,7 @@ function getRealtimeSessionConfig() {
         type: 'function',
         name: 'play_music',
         description:
-          '在酷狗音乐或网易云音乐中搜索并立即播放用户指定的歌曲。用户说「用酷狗放一首晴天」「网易云播放周杰伦的晴天」「放首歌听」时调用；必须实际调用，不能只口头答应。',
+          '在酷狗音乐、网易云音乐或汽水音乐中搜索并立即播放用户指定的歌曲。用户说「用酷狗放一首晴天」「网易云播放周杰伦的晴天」「汽水放首歌听」「放首歌听」时调用；必须实际调用，不能只口头答应。',
         parameters: {
           type: 'object',
           properties: {
@@ -1494,8 +1700,8 @@ function getRealtimeSessionConfig() {
             artist: { type: 'string', description: '歌手名称；用户没有说时留空。' },
             application: {
               type: 'string',
-              enum: ['auto', 'kugou', 'netease'],
-              description: '用户点名酷狗时用 kugou，点名网易云时用 netease；没点名时用 auto。'
+              enum: ['auto', 'kugou', 'netease', 'soda'],
+              description: '用户点名酷狗时用 kugou，点名网易云时用 netease，点名汽水时用 soda；没点名时用 auto。'
             }
           },
           required: ['song', 'application'],
@@ -1506,7 +1712,7 @@ function getRealtimeSessionConfig() {
         type: 'function',
         name: 'control_music',
         description:
-          '控制酷狗音乐或网易云音乐的播放状态。用户说暂停、继续播放、上一首或下一首时调用。没点名软件时使用 auto，自动沿用上次播放的软件。',
+          '控制音乐播放状态。用户说暂停、继续播放、上一首或下一首时调用。没点名软件时使用 auto，自动沿用上次播放的软件。',
         parameters: {
           type: 'object',
           properties: {
@@ -1517,8 +1723,8 @@ function getRealtimeSessionConfig() {
             },
             application: {
               type: 'string',
-              enum: ['auto', 'kugou', 'netease'],
-              description: '用户点名酷狗时用 kugou，点名网易云时用 netease；没点名时用 auto。'
+              enum: ['auto', 'kugou', 'netease', 'soda'],
+              description: '用户点名酷狗时用 kugou，点名网易云时用 netease，点名汽水时用 soda；没点名时用 auto。'
             }
           },
           required: ['action', 'application'],
@@ -1552,7 +1758,7 @@ function getRealtimeSessionConfig() {
         type: 'function',
         name: 'close_application',
         description:
-          '关闭用户明确点名的某个 macOS 应用，例如「关掉抖音」「把微信关了」「关闭观澜」。只用于关闭其他应用；关闭观澜时 application 填“观澜”，用户要求关闭 Jarvis 自己时才改用 quit_jarvis。',
+          '关闭用户明确点名的某个应用，例如「关掉抖音」「把微信关了」「关闭观澜」。只用于关闭其他应用；关闭观澜时 application 填“观澜”，用户要求关闭 Jarvis 自己时才改用 quit_jarvis。',
         parameters: {
           type: 'object',
           properties: { application: { type: 'string', description: '要关闭的应用名称，例如 抖音、微信、Safari。' } },
@@ -1574,7 +1780,21 @@ function getRealtimeSessionConfig() {
           required: ['folder', 'file_name', 'content'],
           additionalProperties: false
         }
-      }
+      },
+      ...(isOpenClawAvailable() ? [{
+        type: 'function' as const,
+        name: 'run_agent_task',
+        description:
+          '把需要写代码、执行脚本、处理文件或完成其他具体任务的请求交给本机 OpenClaw 智能体。用户说「帮我写一个脚本」「帮我完成/搞定/处理某件事」时调用。task 要写清目标、约束和期望产物；任务可能需要几分钟，等待期间保持安静。结果返回末尾带有「（执行过程：…）」摘要，播报时用自己的话简要说明执行了什么、用了哪些工具，不要复述原始输出。',
+        parameters: {
+          type: 'object',
+          properties: {
+            task: { type: 'string', description: '交给智能体的完整任务描述，包含目标、约束和期望产物。' }
+          },
+          required: ['task'],
+          additionalProperties: false
+        }
+      }] : [])
     ],
     tool_choice: 'auto',
     truncation: {
@@ -1583,7 +1803,7 @@ function getRealtimeSessionConfig() {
       token_limits: { post_instructions: 8000 }
     },
     instructions:
-      '你是运行在用户 Mac 上的 Ashley 语音入口。声音表达成熟、低沉、克制、清晰，语速自然，中文咬字清楚，不模仿任何真人或影视角色。一般回答控制在两三句话，用户明确要求展开时再详细说明，并始终说完整句子。不要说“正在思考”“稍等”之类拖延语。天气问题必须调用 get_weather 并原样朗读结果；观澜相关问题调用 query_guanlan，只依据返回数据回答并说明数据时间、缺失或过期状态，不提供自动买卖指令。时间问题调用 get_current_time；酷狗或网易云播放调用 play_music，播放控制调用 control_music；桌面切换调用 switch_desktop。无法由内置工具可靠完成的操作直接简洁说明。用户单独说“Ashley”“艾希莉”“艾什莉”“阿什利”“Jarvis”“贾维斯”或要求现身时调用 show_jarvis。明确要求完全退出程序时调用 quit_jarvis；普通告别、休眠或待机调用 end_conversation，调用前不要说话。用户明确命令点头、摇头或转动时调用对应头部动作工具。'
+      '你是运行在用户电脑上的 Ashley 语音入口。声音表达成熟、低沉、克制、清晰，语速自然，中文咬字清楚，不模仿任何真人或影视角色。一般回答控制在两三句话，用户明确要求展开时再详细说明，并始终说完整句子。不要说“正在思考”“稍等”之类拖延语。天气问题必须调用 get_weather 并原样朗读结果；观澜相关问题调用 query_guanlan，只依据返回数据回答并说明数据时间、缺失或过期状态，不提供自动买卖指令。时间问题调用 get_current_time；酷狗、网易云或汽水播放调用 play_music，播放控制调用 control_music；桌面切换调用 switch_desktop。用户要求写代码、写脚本或完成具体任务时调用 run_agent_task，等待期间保持安静，结果返回后简洁播报，并用自己的话简要说明返回末尾「（执行过程：…）」摘要里的执行内容和所用工具。无法由内置工具可靠完成的操作直接简洁说明。用户单独说“Ashley”“艾希莉”“艾什莉”“阿什利”“Jarvis”“贾维斯”或要求现身时调用 show_jarvis。明确要求完全退出程序时调用 quit_jarvis；普通告别、休眠或待机调用 end_conversation，调用前不要说话。用户明确命令点头、摇头或转动时调用对应头部动作工具。'
   };
 }
 
@@ -1634,11 +1854,20 @@ async function createRealtimeCall(sdp: string) {
   if (!apiKey) throw new Error('OPENAI_API_KEY 未配置。');
   if (!sdp.startsWith('v=0') || sdp.length > 200_000) throw new Error('Realtime SDP 无效。');
 
+  // JARVIS_OPENAI_BASE_URL 可把 Realtime 接口指向中转或兼容服务，例如
+  // https://relay.example.com。默认仍是官方地址。
+  const configuredBase = process.env.JARVIS_OPENAI_BASE_URL?.trim();
+  const baseUrl = configuredBase ? new URL(configuredBase) : new URL('https://api.openai.com');
+  if (!['http:', 'https:'].includes(baseUrl.protocol)) {
+    throw new Error('JARVIS_OPENAI_BASE_URL 只支持 HTTP 或 HTTPS 地址。');
+  }
+  const endpoint = new URL('/v1/realtime/calls', baseUrl);
+
   const form = new FormData();
   form.set('sdp', sdp);
   form.set('session', JSON.stringify(getRealtimeSessionConfig()));
   const safetyIdentifier = createHash('sha256').update(app.getPath('userData')).digest('hex');
-  const response = await fetch('https://api.openai.com/v1/realtime/calls', {
+  const response = await fetch(endpoint.href, {
     method: 'POST',
     headers: {
       Authorization: `Bearer ${apiKey}`,
@@ -1648,7 +1877,7 @@ async function createRealtimeCall(sdp: string) {
   });
   const answer = await response.text();
   if (!response.ok) throw new Error(`Realtime API ${response.status}: ${answer}`);
-  log('Realtime Mini WebRTC session connected.');
+  log(`Realtime Mini WebRTC session connected via ${endpoint.host}.`);
   return answer;
 }
 
@@ -1824,7 +2053,7 @@ function createJarvisWindow() {
         if (!target || target.webContents.isDestroyed()) return;
         const image = await target.webContents.capturePage();
         await fs.writeFile(
-          process.env.JARVIS_QA_CAPTURE_PATH || '/private/tmp/jarvis-visual-qa.png',
+          process.env.JARVIS_QA_CAPTURE_PATH || path.join(os.tmpdir(), 'jarvis-visual-qa.png'),
           image.toPNG()
         );
         log('Visual QA capture written.');
@@ -1982,15 +2211,56 @@ function refreshTrayMenu() {
           }
         ]
       },
+      // 语音搜歌的界面坐标校准入口:导出播放器 UIA 树和窗口几何信息,
+      // 交给开发者算出搜索框/第一行结果的点击位置。
+      ...(process.platform === 'win32'
+        ? [{
+            label: '音乐搜索调试',
+            submenu: [
+              { label: '导出网易云音乐界面信息…', click: () => void dumpMusicUiForTuning('netease') },
+              { label: '导出酷狗音乐界面信息…', click: () => void dumpMusicUiForTuning('kugou') },
+              { label: '导出汽水音乐界面信息…', click: () => void dumpMusicUiForTuning('soda') }
+            ]
+          }]
+        : []),
       { type: 'separator' },
       { label: '退出', click: () => app.quit() }
     ])
   );
 }
 
+async function dumpMusicUiForTuning(player: WindowsMusicPlayer) {
+  try {
+    const outDir = path.join(app.getPath('userData'), 'music-debug');
+    await fs.mkdir(outDir, { recursive: true });
+    const resultPath = await dumpWindowsMusicPlayerUi(player, outDir);
+    clipboard.writeText(resultPath);
+    log(`Music UI debug dump written: ${resultPath}`);
+    await dialog.showMessageBox({
+      type: 'info',
+      title: '音乐搜索调试',
+      message: `界面信息已导出：\n${resultPath}\n\n路径已复制到剪贴板，请把该文件发给开发者以校准点击坐标。`
+    });
+  } catch (error) {
+    await dialog.showMessageBox({
+      type: 'warning',
+      title: '音乐搜索调试',
+      message: `导出失败：${error instanceof Error ? error.message : String(error)}`
+    });
+  }
+}
+
 function createTrayIcon() {
-  const icon = nativeImage.createFromPath(path.join(__dirname, '../assets/tray/iconTemplate.png'));
-  icon.setTemplateImage(true);
+  // macOS 的 template 图是单色黑,GNOME 深色顶栏上看不见,Linux 用构建时
+  // 生成的反白版本;setTemplateImage 本身也是 macOS 专属。Windows 用着色版,
+  // 深浅任务栏都可见。
+  const iconPath = process.platform === 'linux'
+    ? path.join(__dirname, '../assets/tray/icon-linux.png')
+    : process.platform === 'win32'
+      ? path.join(__dirname, '../assets/tray/icon-windows.png')
+      : path.join(__dirname, '../assets/tray/iconTemplate.png');
+  const icon = nativeImage.createFromPath(iconPath);
+  if (process.platform === 'darwin') icon.setTemplateImage(true);
   tray = new Tray(icon);
   tray.setToolTip('Ashley');
   refreshTrayMenu();
@@ -2031,6 +2301,12 @@ if (!hasSingleInstanceLock) {
     log(
       `Voice configuration loaded: provider=${configuredVoiceProvider}, voice=${configuredVoice}, `
       + `fallback=${voiceFallback}, doubaoCredentials=${doubaoCredentials}.`
+    );
+    const openClawBin = resolveOpenClawBin();
+    log(
+      openClawBin
+        ? `OpenClaw bridge available at ${openClawBin}.`
+        : 'OpenClaw bridge not detected; run_agent_task disabled.'
     );
     app.dock?.hide();
     registerIpcHandlers();

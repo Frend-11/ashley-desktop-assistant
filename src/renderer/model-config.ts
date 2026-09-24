@@ -1,5 +1,5 @@
 export const modelConfig = {
-  helmetModelFile: 'model.high.glb',
+  helmetModelFile: 'model.glb',
   rotationX: 0,
   rotationY: 0,
   rotationZ: 0,

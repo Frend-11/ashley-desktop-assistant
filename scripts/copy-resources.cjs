@@ -7,8 +7,18 @@ const distRoot = path.join(projectRoot, 'dist');
 
 const nativeDestination = path.join(distRoot, 'native');
 fs.rmSync(nativeDestination, { recursive: true, force: true });
+fs.mkdirSync(nativeDestination, { recursive: true });
+
+// Windows 桥接脚本(PowerShell 5.1,系统自带)无条件拷贝:Windows 包可能在
+// 任何宿主机上交叉构建,bridge 运行时才读这些文件。
+for (const script of ['windows-shell.ps1', 'music-automation.ps1', 'play-sound.ps1']) {
+  fs.copyFileSync(
+    path.join(projectRoot, 'src', 'native', script),
+    path.join(nativeDestination, script)
+  );
+}
+
 if (process.platform === 'darwin') {
-  fs.mkdirSync(nativeDestination, { recursive: true });
   execFileSync('/usr/bin/swiftc', [
     '-O',
     path.join(projectRoot, 'src', 'native', 'window-status.swift'),
@@ -49,6 +59,55 @@ for (const directory of ['renderer', 'assets']) {
     }
   });
 }
+
+// macOS 的 template 托盘图是单色黑，在 GNOME 的深色顶栏上看不见。
+// Linux 构建时反白一份，主进程按平台选用。
+if (process.platform === 'linux') {
+  const sharp = require('sharp');
+  sharp(path.join(projectRoot, 'assets', 'tray', 'iconTemplate@2x.png'))
+    .negate()
+    .resize(64, 64)
+    .png()
+    .toFile(path.join(distRoot, 'assets', 'tray', 'icon-linux.png'))
+    .catch((error) => {
+      console.error('Unable to generate the Linux tray icon.', error);
+      process.exitCode = 1;
+    });
+}
+
+// Windows 任务栏深浅色都常见，把单色剪影重着色成琥珀色。这里无条件生成:
+// Windows 安装包可能在 Linux/macOS 宿主机上交叉构建，构建时的 process.platform
+// 是宿主机平台，不是目标平台。
+async function generateWindowsTrayIcons() {
+  const sharp = require('sharp');
+  const source = path.join(projectRoot, 'assets', 'tray', 'iconTemplate@2x.png');
+  const { data, info } = await sharp(source).ensureAlpha().raw().toBuffer({ resolveWithObject: true });
+  for (let index = 0; index < data.length; index += info.channels) {
+    if (data[index + 3] > 0) {
+      data[index] = 0xE8;
+      data[index + 1] = 0xA3;
+      data[index + 2] = 0x3D;
+    }
+  }
+  const colored = sharp(data, { raw: { width: info.width, height: info.height, channels: 4 } });
+  await colored
+    .clone()
+    .resize(32, 32)
+    .png()
+    .toFile(path.join(distRoot, 'assets', 'tray', 'icon-windows.png'));
+  // electron-builder 的 Windows 图标要求 ≥256×256;源图只有 36px,放大偏软,
+  // 功能可用,有正式图标后替换 assets/tray 源图即可。
+  await colored
+    .clone()
+    .resize(256, 256, { kernel: 'lanczos3' })
+    .png()
+    .toFile(path.join(distRoot, 'assets', 'tray', 'icon-windows-256.png'));
+}
+
+generateWindowsTrayIcons().catch((error) => {
+  console.error('Unable to generate the Windows tray icons.', error);
+  process.exitCode = 1;
+});
 
 fs.cpSync(
   path.join(projectRoot, 'node_modules', 'three', 'examples', 'jsm', 'libs', 'draco'),
